@@ -1,5 +1,5 @@
 import { PASSWORD_MIN_LENGTH } from '../config.js';
-import { isSubset, requirePermission } from '../auth/permissions.js';
+import { isSubset, requirePermission, PERMISSION_KEYS } from '../auth/permissions.js';
 import { loadProfile, loadProfiles, serializeUser } from '../auth/profiles.js';
 import { hashPassword } from '../lib/crypto.js';
 import { all, batch, first, nowIso, prepare, toFlag } from '../lib/db.js';
@@ -9,14 +9,10 @@ import { EMAIL_RE, PHONE_RE, Validator, idParam, normalizePhone } from '../lib/v
 import { loadRole } from './roles.js';
 
 // Fields a user may not change about themselves (prevents self-escalation and self-lockout)
-const SELF_RESTRICTED = ['role_id', 'all_synagogues', 'synagogue_ids', 'is_active', 'is_super_admin'];
+const SELF_RESTRICTED = ['role_id', 'all_synagogues', 'synagogue_ids', 'is_active', 'is_super_admin', 'personal_permissions'];
 
 // ---- authorization rules ---------------------------------------------------
 
-/**
- * Anti-escalation: a non-super-admin can manage a user only if everything that user can do
- * (permissions) and everywhere they can do it (synagogue scope) is within the manager's own reach.
- */
 function canManage(actor, target) {
   if (actor.is_super_admin) return true;
   if (target.is_super_admin) return false;
@@ -33,7 +29,7 @@ function assertCanManage(actor, target) {
 }
 
 // Validates that the actor may hand out the requested role / scope / flags
-async function assertCanAssign(env, actor, { role_id, all_synagogues, synagogue_ids, is_super_admin }) {
+async function assertCanAssign(env, actor, { role_id, all_synagogues, synagogue_ids, is_super_admin, personal_permissions }) {
   if (is_super_admin === true && !actor.is_super_admin) {
     throw forbidden('רק מנהל ראשי יכול למנות מנהל ראשי', 'CANNOT_ASSIGN');
   }
@@ -42,6 +38,11 @@ async function assertCanAssign(env, actor, { role_id, all_synagogues, synagogue_
     if (!role) throw validationError([{ field: 'role_id', message: 'התפקיד לא קיים' }]);
     if (!actor.is_super_admin && !isSubset(role.permissions, actor.permissions)) {
       throw forbidden('אינך יכול להקצות תפקיד שכולל הרשאות שאין לך', 'CANNOT_ASSIGN');
+    }
+  }
+  if (personal_permissions !== undefined) {
+    if (!actor.is_super_admin && !isSubset(new Set(personal_permissions), actor.permissions)) {
+      throw forbidden('אינך יכול להקצות הרשאות אישיות שאין לך', 'CANNOT_ASSIGN');
     }
   }
   if (all_synagogues === true && !actor.all_synagogues) {
@@ -98,6 +99,7 @@ function parseUser(body, partial) {
     .int('role_id', { nullable: true })
     .bool('all_synagogues')
     .intArray('synagogue_ids')
+    .stringArray('personal_permissions', { allowed: PERMISSION_KEYS })
     .bool('is_active')
     .bool('is_super_admin');
   return v.result();
@@ -133,6 +135,8 @@ export async function create(ctx) {
 
   const now = nowIso();
   const synagogueIds = d.synagogue_ids ?? [];
+  const personalPerms = d.personal_permissions ?? [];
+  
   const results = await batch(env, [
     prepare(
       env,
@@ -142,6 +146,7 @@ export async function create(ctx) {
       toFlag(d.is_super_admin === true), d.role_id ?? null, toFlag(d.all_synagogues === true), toFlag(d.is_active !== false), now, now
     ),
     prepare(env, `INSERT INTO UserSynagogues (user_id, synagogue_id) SELECT last_insert_rowid(), value FROM json_each(?)`, JSON.stringify(synagogueIds)),
+    prepare(env, `INSERT INTO UserPermissions (user_id, permission) SELECT last_insert_rowid(), value FROM json_each(?)`, JSON.stringify(personalPerms)),
   ]);
   return created(serializeUser(await getProfileOr404(env, results[0].meta.last_row_id)));
 }
@@ -156,7 +161,7 @@ export async function update(ctx) {
   const isSelf = target.id === actor.id;
   if (isSelf) {
     if (SELF_RESTRICTED.some((key) => key in body)) {
-      throw forbidden('לא ניתן לשנות את התפקיד, ההיקף או הסטטוס של עצמך', 'CANNOT_MODIFY_SELF');
+      throw forbidden('לא ניתן לשנות את התפקיד, ההיקף, ההרשאות האישיות או הסטטוס של עצמך', 'CANNOT_MODIFY_SELF');
     }
   } else {
     assertCanManage(actor, target);
@@ -201,6 +206,12 @@ export async function update(ctx) {
       prepare(env, `INSERT INTO UserSynagogues (user_id, synagogue_id) SELECT ?, value FROM json_each(?)`, id, JSON.stringify(d.synagogue_ids))
     );
   }
+  if ('personal_permissions' in d) {
+    statements.push(
+      prepare(env, `DELETE FROM UserPermissions WHERE user_id = ?`, id),
+      prepare(env, `INSERT INTO UserPermissions (user_id, permission) SELECT ?, value FROM json_each(?)`, id, JSON.stringify(d.personal_permissions))
+    );
+  }
   // new password or deactivation => sign the user out everywhere (except the current device when editing yourself)
   if (d.password || d.is_active === false) {
     statements.push(prepare(env, `DELETE FROM Sessions WHERE user_id = ? AND id != ?`, id, isSelf ? actor.session_id : 0));
@@ -221,6 +232,7 @@ export async function remove({ env, actor, params }) {
   await batch(env, [
     prepare(env, `DELETE FROM Sessions WHERE user_id = ?`, id),
     prepare(env, `DELETE FROM UserSynagogues WHERE user_id = ?`, id),
+    prepare(env, `DELETE FROM UserPermissions WHERE user_id = ?`, id),
     prepare(env, `DELETE FROM Users WHERE id = ?`, id),
   ]);
   return ok(null);
