@@ -5,6 +5,7 @@ import { forbidden } from '../lib/errors.js';
 export const PERMISSIONS = Object.freeze({
   'synagogues:create': { group: 'בתי כנסת', label: 'יצירת בתי כנסת' },
   'synagogues:update': { group: 'בתי כנסת', label: 'עריכת פרטי בית כנסת' },
+  'synagogues:unrestricted_update': { group: 'בתי כנסת', label: 'עריכת שדות מוגבלים בבתי כנסת ועקיפת הגדרות (שם, אזור, מיקומים)' },
   'synagogues:delete': { group: 'בתי כנסת', label: 'מחיקת בתי כנסת' },
   'locations:create': { group: 'מיקומים', label: 'יצירת מיקומים' },
   'locations:update': { group: 'מיקומים', label: 'עריכת מיקומים' },
