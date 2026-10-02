@@ -1,0 +1,22 @@
+name = "zmanim-api"
+main = "src/index.js"
+compatibility_date = "2026-05-24"
+
+# Daily cleanup of expired sessions / old login-attempt rows
+[triggers]
+crons = ["0 3 * * *"]
+
+[observability]
+enabled = true
+
+# Comma-separated list of allowed front-end origins, e.g. "https://example.com".
+# Empty = any origin (safe here because auth uses Bearer tokens, not cookies).
+[vars]
+ALLOWED_ORIGINS = ""
+
+# Database binding (unchanged)
+[[d1_databases]]
+binding = "DB"
+database_name = "zmanim"
+database_id = "0cfa6f34-aa5e-4662-abd4-a6980d0aea32"
+migrations_dir = "migrations"
