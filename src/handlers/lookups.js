@@ -1,174 +1,81 @@
-import { requirePermission } from '../auth/permissions.js';
-import { all, batch, first, nowIso, parseIdList, prepare, toBool, toFlag } from '../lib/db.js';
-import { conflict, notFound } from '../lib/errors.js';
+import { requirePermission, requireSynagogueAccess, scopeClause } from '../auth/permissions.js';
+import { all, batch, first, prepare } from '../lib/db.js';
+import { notFound, conflict, validationError } from '../lib/errors.js';
 import { created, ok } from '../lib/http.js';
-import { TIME_RE, Validator, idParam } from '../lib/validate.js';
+import { intParam, idParam, Validator } from '../lib/validate.js';
 
-/**
- * Reference tables are managed through one declarative config.
- * Table/column names come ONLY from this config (never from user input).
- *
- * If your tables have extra columns that the UI edits, add them under `fields` — one line each.
- * Extra columns are always returned on reads (SELECT *), they just are not writable until declared.
- */
-export const LOOKUPS = {
-  areas: {
-    path: '/areas',
-    table: 'Areas',
-    label: 'האזור',
-    fields: { name: { type: 'string', required: true, max: 100 } },
-    usedBy: [{ table: 'Synagogues', column: 'area_id', label: 'בתי כנסת' }],
-  },
-  'prayer-types': {
-    path: '/prayer-types',
-    table: 'PrayerTypes',
-    label: 'סוג התפילה',
-    fields: {
-      name: { type: 'string', required: true, max: 100 },
-      allow_update_from: { type: 'time' },
-      allow_update_to: { type: 'time' },
-    },
-    usedBy: [{ table: 'Minyanim', column: 'prayer_type_id', label: 'מניינים' }],
-  },
-  'time-types': {
-    path: '/time-types',
-    table: 'TimeTypes',
-    label: 'סוג הזמן',
-    fields: {
-      name: { type: 'string', required: true, max: 100 },
-      is_relative: { type: 'bool' },
-      allowed_prayer_ids: { type: 'idlist' },
-    },
-    usedBy: [{ table: 'Minyanim', column: 'time_type_id', label: 'מניינים' }],
-  },
-  seasons: {
-    path: '/seasons',
-    table: 'Seasons',
-    label: 'העונה',
-    fields: {
-      name: { type: 'string', required: true, max: 100 },
-      is_default: { type: 'bool' },
-    },
-    exclusiveFlag: 'is_default', // at most one row may have this flag, and it cannot be unset directly
-    usedBy: [{ table: 'Minyanim', column: 'season_id', label: 'מניינים' }],
-  },
-};
+const SELECT = `SELECT l.*, s.name AS synagogue_name FROM Locations l JOIN Synagogues s ON s.id = l.synagogue_id`;
 
-// DB row -> API shape (booleans and id lists become real JSON types)
-export function serializeLookup(config, row) {
-  const out = { ...row };
-  for (const [key, spec] of Object.entries(config.fields)) {
-    if (!(key in out)) continue;
-    if (spec.type === 'bool') out[key] = toBool(out[key]);
-    if (spec.type === 'idlist') out[key] = parseIdList(out[key]);
-  }
-  return out;
-}
-
-function validate(config, body, partial) {
-  const v = new Validator(body, { partial });
-  for (const [key, spec] of Object.entries(config.fields)) {
-    if (spec.type === 'string') v.string(key, { required: spec.required, max: spec.max ?? 100 });
-    if (spec.type === 'time') v.string(key, { nullable: true, pattern: TIME_RE, patternMessage: 'פורמט שעה נדרש: HH:MM' });
-    if (spec.type === 'bool') v.bool(key);
-    if (spec.type === 'idlist') v.intArray(key, { nullable: true });
-  }
-  return v.result();
-}
-
-// API values -> DB values
-function toDb(config, values) {
-  const out = {};
-  for (const [key, value] of Object.entries(values)) {
-    const type = config.fields[key].type;
-    if (type === 'bool') out[key] = toFlag(value);
-    else if (type === 'idlist') out[key] = value.length ? JSON.stringify(value) : null;
-    else out[key] = value;
-  }
-  return out;
-}
-
-async function getRow(env, config, id) {
-  const row = await first(env, `SELECT * FROM ${config.table} WHERE id = ?`, id);
-  if (!row) throw notFound(`${config.label} לא נמצא`);
+async function getOr404(env, id) {
+  const row = await first(env, `${SELECT} WHERE l.id = ?`, id);
+  if (!row) throw notFound('המיקום לא נמצא');
   return row;
 }
 
-function makeHandlers(config) {
-  const flag = config.exclusiveFlag;
-
-  return {
-    async list({ env }) {
-      const rows = await all(env, `SELECT * FROM ${config.table} ORDER BY id`);
-      return ok(rows.map((r) => serializeLookup(config, r)));
-    },
-
-    async create(ctx) {
-      requirePermission(ctx.actor, 'settings:manage');
-      const values = toDb(config, validate(config, await ctx.body(), false));
-      const keys = Object.keys(values);
-      const insert = prepare(
-        ctx.env,
-        `INSERT INTO ${config.table} (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
-        ...Object.values(values)
-      );
-      const statements = flag && values[flag] === 1 ? [prepare(ctx.env, `UPDATE ${config.table} SET ${flag} = 0`), insert] : [insert];
-      const results = await batch(ctx.env, statements);
-      const id = results[results.length - 1].meta.last_row_id;
-      return created(serializeLookup(config, await getRow(ctx.env, config, id)));
-    },
-
-    async update(ctx) {
-      requirePermission(ctx.actor, 'settings:manage');
-      const id = idParam(ctx.params.id);
-      const current = await getRow(ctx.env, config, id);
-      const values = toDb(config, validate(config, await ctx.body(), true));
-      const keys = Object.keys(values);
-      if (keys.length === 0) return ok(serializeLookup(config, current));
-
-      if (flag && values[flag] === 0 && current[flag] === 1) {
-        throw conflict('לא ניתן לבטל ברירת מחדל ישירות. יש להגדיר רשומה אחרת כברירת מחדל', 'DEFAULT_REQUIRED');
-      }
-      const update = prepare(
-        ctx.env,
-        `UPDATE ${config.table} SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`,
-        ...Object.values(values),
-        id
-      );
-      const statements = flag && values[flag] === 1 ? [prepare(ctx.env, `UPDATE ${config.table} SET ${flag} = 0 WHERE id != ?`, id), update] : [update];
-      await batch(ctx.env, statements);
-      return ok(serializeLookup(config, await getRow(ctx.env, config, id)));
-    },
-
-    async remove(ctx) {
-      requirePermission(ctx.actor, 'settings:manage');
-      const id = idParam(ctx.params.id);
-      const current = await getRow(ctx.env, config, id);
-      if (flag && current[flag] === 1) {
-        throw conflict('לא ניתן למחוק את רשומת ברירת המחדל', 'DEFAULT_REQUIRED');
-      }
-
-      const usage = {};
-      for (const { table, column, label } of config.usedBy) {
-        const row = await first(ctx.env, `SELECT COUNT(*) AS c FROM ${table} WHERE ${column} = ?`, id);
-        if (row.c > 0) usage[label] = row.c;
-      }
-      if (Object.keys(usage).length) {
-        throw conflict(`לא ניתן למחוק: ${config.label} בשימוש`, 'IN_USE', usage);
-      }
-
-      await prepare(ctx.env, `DELETE FROM ${config.table} WHERE id = ?`, id).run();
-      return ok(null);
-    },
-  };
+export async function list({ env, actor, url }) {
+  const scope = scopeClause(actor, 'l.synagogue_id');
+  const where = [scope.sql];
+  const params = [...scope.params];
+  const synagogueId = intParam(url, 'synagogue_id');
+  if (synagogueId !== null) {
+    where.push('l.synagogue_id = ?');
+    params.push(synagogueId);
+  }
+  return ok(await all(env, `${SELECT} WHERE ${where.join(' AND ')} ORDER BY l.name`, ...params));
 }
 
-export function registerLookupRoutes(router) {
-  for (const config of Object.values(LOOKUPS)) {
-    const h = makeHandlers(config);
-    router.get(config.path, h.list);
-    router.post(config.path, h.create);
-    router.patch(`${config.path}/:id`, h.update);
-    router.delete(`${config.path}/:id`, h.remove);
+export async function get({ env, actor, params }) {
+  const row = await getOr404(env, idParam(params.id));
+  requireSynagogueAccess(actor, row.synagogue_id);
+  return ok(row);
+}
+
+export async function create(ctx) {
+  const { env, actor } = ctx;
+  requirePermission(actor, 'locations:create');
+  const d = new Validator(await ctx.body())
+    .int('synagogue_id', { required: true })
+    .string('name', { required: true, max: 120 })
+    .result();
+
+  const syn = await first(env, `SELECT id, max_locations FROM Synagogues WHERE id = ?`, d.synagogue_id);
+  if (!syn) {
+    throw validationError([{ field: 'synagogue_id', message: 'בית הכנסת לא קיים' }]);
   }
+  requireSynagogueAccess(actor, d.synagogue_id);
+
+  const counts = await first(env, `SELECT COUNT(*) AS c FROM Locations WHERE synagogue_id = ?`, d.synagogue_id);
+  if (counts.c >= syn.max_locations) {
+    throw conflict(`לא ניתן להוסיף יותר מ-${syn.max_locations} מיקומים לבית כנסת זה`, 'MAX_LOCATIONS_REACHED');
+  }
+
+  const res = await prepare(env, `INSERT INTO Locations (name, synagogue_id) VALUES (?, ?)`, d.name, d.synagogue_id).run();
+  return created(await getOr404(env, res.meta.last_row_id));
+}
+
+// A location's synagogue is immutable: minyanim reference it. Only the name can change.
+export async function update(ctx) {
+  const { env, actor } = ctx;
+  requirePermission(actor, 'locations:update');
+  const id = idParam(ctx.params.id);
+  const current = await getOr404(env, id);
+  requireSynagogueAccess(actor, current.synagogue_id);
+
+  const d = new Validator(await ctx.body(), { partial: true }).string('name', { required: true, max: 120 }).result();
+  if (d.name !== undefined) await prepare(env, `UPDATE Locations SET name = ? WHERE id = ?`, d.name, id).run();
+  return ok(await getOr404(env, id));
+}
+
+export async function remove({ env, actor, params }) {
+  requirePermission(actor, 'locations:delete');
+  const id = idParam(params.id);
+  const current = await getOr404(env, id);
+  requireSynagogueAccess(actor, current.synagogue_id);
+
+  // minyanim keep existing, they just lose their specific location
+  await batch(env, [
+    prepare(env, `UPDATE Minyanim SET location_id = NULL WHERE location_id = ?`, id),
+    prepare(env, `DELETE FROM Locations WHERE id = ?`, id),
+  ]);
+  return ok(null);
 }
